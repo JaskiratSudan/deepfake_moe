@@ -1,3 +1,5 @@
+# eval_utils.py
+
 import os
 import numpy as np
 import matplotlib.pyplot as plt
@@ -17,7 +19,10 @@ def evaluate_and_plot(model, loader, device, plot_dir="plots", log_file="logs/ev
         for x, y in loader:
             x = x.to(device)
             y_true.extend(y.numpy())
+
             y_pred.extend(torch.sigmoid(model(x)).cpu().numpy().flatten())
+            # y_pred.extend(model(x))
+
 
     y_true, y_pred = np.array(y_true), np.array(y_pred)
     y_bin = (y_pred > 0.5).astype(int)
