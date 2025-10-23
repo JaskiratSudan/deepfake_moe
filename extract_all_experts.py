@@ -1,94 +1,113 @@
 # ============================================================
-# extract_all_experts.py
+# extract_all_experts.py  (updated to also extract ITW)
 # ============================================================
 import os
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-# Import your encoders and utils
+# ── Encoders and dataset/utils
 from encoders.experts import (
     StyleEncoder, LinguisticEncoder,
     WaveLMEncoder, HuBERTEncoder, Emotion2VecEncoder
 )
-from modules.dataset_utils import extract_and_cache_embeddings, CachedEmbeddingDataset
-from modules.data_loader import ASVspoof2019Dataset  
+from modules.dataset_utils import extract_and_cache_embeddings
+from modules.data_loader import ASVspoof2019Dataset, InTheWildDataset
 
-# ---------------- CONFIG ----------------
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-cache_root = "cache"
-split_name = "train"  # choose "train", "dev", or "eval"
-batch_size = 8
-num_workers = 4
-num_samples = None  # optionally limit samples for quick tests
+# ---------------- Config ----------------
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+BATCH_SIZE = 8
+NUM_WORKERS = 4
+PIN_MEMORY = True
 
-# ---------------- DATASET LOADING ----------------
-datasets_info = {
-    "train": {
-        "root_dir": "/nfs/turbo/umd-hafiz/issf_server_data/AsvSpoofData_2019/train/LA/ASVspoof2019_LA_train/flac",
-        "protocol_file": "/nfs/turbo/umd-hafiz/issf_server_data/AsvSpoofData_2019/train/LA/ASVspoof2019_train_protocol_with_speaker.txt",
-        "num_samples": num_samples,
-    },
-    "dev": {
-        "root_dir": "/nfs/turbo/umd-hafiz/issf_server_data/AsvSpoofData_2019/train/LA/ASVspoof2019_LA_dev/flac",
-        "protocol_file": "/nfs/turbo/umd-hafiz/issf_server_data/AsvSpoofData_2019/train/LA/ASVspoof2019_dev_protocol_with_speaker.txt",
-        "num_samples": num_samples,
-    },
-    "eval": {
-        "root_dir": "/nfs/turbo/umd-hafiz/issf_server_data/AsvSpoofData_2019/train/LA/ASVspoof2019_LA_eval/flac",
-        "protocol_file": "/nfs/turbo/umd-hafiz/issf_server_data/AsvSpoofData_2019/train/LA/ASVspoof2019_eval_protocol_with_speaker.txt",
-        "num_samples": num_samples,
-    },
+# Where to cache embeddings
+CACHE_DIR = "cache"
+
+# ASVspoof2019 paths (leave as-is if yours are already right)
+ASV19_ROOTS = {
+    "train": "/nfs/turbo/umd-hafiz/issf_server_data/AsvSpoofData_2019/train/LA/ASVspoof2019_LA_train/flac",  # e.g., "/scratch"
+    "dev":   "/nfs/turbo/umd-hafiz/issf_server_data/AsvSpoofData_2019/train/LA/ASVspoof2019_LA_dev/flac",               # e.g., "/scratch"
+    "eval":  "/nfs/turbo/umd-hafiz/issf_server_data/AsvSpoofData_2019/train/LA/ASVspoof2019_LA_eval/flac",               # e.g., "/scratch"
 }
 
-print(f"[LOAD] Preparing {split_name} dataset...")
-info = datasets_info[split_name]
-optional_args = {k: v for k, v in info.items() if k not in ["root_dir", "protocol_file"]}
-dataset = ASVspoof2019Dataset(root_dir=info["root_dir"], protocol_file=info["protocol_file"], **optional_args)
-dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
-print(f"[DATA] Loaded {len(dataset)} samples from {split_name} split.\n")
+ASV19_PROTOCOLS = {
+    "train": "/nfs/turbo/umd-hafiz/issf_server_data/AsvSpoofData_2019/train/LA/ASVspoof2019_train_protocol_with_speaker.txt",
+    "dev":   "/nfs/turbo/umd-hafiz/issf_server_data/AsvSpoofData_2019/train/LA/ASVspoof2019_dev_protocol_with_speaker.txt",
+    "eval":  "/nfs/turbo/umd-hafiz/issf_server_data/AsvSpoofData_2019/train/LA/ASVspoof2019_eval_protocol_with_speaker.txt",
+}
 
-# ---------------- EXPERT DEFINITIONS ----------------
+# ✅ ITW paths (SET THESE to your actual locations)
+ITW_ROOT = "/nfs/turbo/umd-hafiz/issf_server_data/ds_wild/release_in_the_wild"               # folder containing wav/flac files
+ITW_META_CSV = "/nfs/turbo/umd-hafiz/issf_server_data/ds_wild/protocols/meta.csv"   # CSV with at least ['file','label']
+
 EXPERTS = {
-    "style": StyleEncoder,
+    "style":      StyleEncoder,
     "linguistic": LinguisticEncoder,
-    "wavelm": WaveLMEncoder,
-    "hubert": HuBERTEncoder,
+    "hubert":     HuBERTEncoder,
+    "wavelm":     WaveLMEncoder,
     "emotion2vec": Emotion2VecEncoder,
 }
 
-# ---------------- EXTRACTION LOOP ----------------
-for name, model_cls in EXPERTS.items():
-    print(f"\n======================\n[EXPERT] {name}\n======================")
-
-    expert_cache = os.path.join(cache_root, name)
-    os.makedirs(expert_cache, exist_ok=True)
-
-    emb_path = os.path.join(expert_cache, f"{split_name}_embeddings.npy")
-    lab_path = os.path.join(expert_cache, f"{split_name}_labels.npy")
-
-    # Skip if already cached
-    if os.path.exists(emb_path) and os.path.exists(lab_path):
-        print(f"[CACHE] Found cached {name} embeddings → Skipping extraction.")
-        continue
-
-    # Load model lazily
-    print(f"[LOAD] Loading {name} model...")
-    model = model_cls().to(device)
-
-    # Extract and cache embeddings
-    print(f"[RUN] Extracting {name} embeddings...")
-    extract_and_cache_embeddings(
-        encoder=model,
-        dataloader=dataloader,
-        cache_dir=expert_cache,
-        split_name=split_name,
-        device=device,
+def make_loader(dataset):
+    return DataLoader(
+        dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=NUM_WORKERS,
+        pin_memory=PIN_MEMORY,
     )
 
-    # Cleanup
-    del model
-    torch.cuda.empty_cache()
-    print(f"[DONE] Finished {name} extraction.\n")
+def ensure_dir(p):
+    os.makedirs(p, exist_ok=True)
+    return p
 
-print("\n✅ All experts processed successfully.")
+if __name__ == "__main__":
+    os.makedirs(CACHE_DIR, exist_ok=True)
+
+    for name, EncClass in EXPERTS.items():
+        print(f"\n==================== {name.upper()} ====================")
+        model = EncClass(freeze_model=True).to(DEVICE)
+        model.eval()
+
+        # --------- ASVspoof2019 (train/dev/eval with per-split roots) ----------
+        asv_cache_root = ensure_dir(os.path.join(CACHE_DIR, "ASVspoof2019", name))
+        for split, protocol_file in ASV19_PROTOCOLS.items():
+            root_dir = ASV19_ROOTS.get(split, "")
+            if not root_dir:
+                print(f"[WARN] Missing ASV19 root for split '{split}', skipping.")
+                continue
+            if not os.path.exists(protocol_file):
+                print(f"[WARN] Missing ASV19 protocol for split '{split}': {protocol_file}")
+                continue
+
+            print(f"[ASVspoof2019] {name} → split={split}")
+            ds = ASVspoof2019Dataset(protocol_file=protocol_file, root_dir=root_dir)
+            dl = make_loader(ds)
+            extract_and_cache_embeddings(
+                encoder=model,
+                dataloader=dl,
+                cache_dir=asv_cache_root,
+                split_name=split,
+                device=DEVICE,
+            )
+
+        # --------- InTheWild (eval only) ----------
+        itw_cache_root = ensure_dir(os.path.join(CACHE_DIR, "ITW", name))
+        if os.path.exists(ITW_META_CSV):
+            print(f"[ITW] {name} → split=eval")
+            itw_ds = InTheWildDataset(root_dir=ITW_ROOT, protocol_file=ITW_META_CSV, subset="all")
+            itw_dl = make_loader(itw_ds)
+            extract_and_cache_embeddings(
+                encoder=model,
+                dataloader=itw_dl,
+                cache_dir=itw_cache_root,
+                split_name="eval",   # keep as 'eval' for symmetry
+                device=DEVICE,
+            )
+        else:
+            print(f"[WARN] ITW metadata CSV not found at {ITW_META_CSV}; skipping ITW for {name}")
+
+        del model
+        torch.cuda.empty_cache()
+
+    print("\n✅ All experts processed successfully.")

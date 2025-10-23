@@ -1,163 +1,272 @@
-# train_expert_classifier.py
-
+# scripts/train_expert_classifier.py
+"""
+Train per-expert binary classifier heads on cached embeddings (no CLI args).
+- Z-score normalization (fit on train, saved in checkpoint)
+- pos_weight for class imbalance
+- Early stopping on DEV EER
+- Cosine LR with warmup
+- Saves: model_checkpoints/<expert>/best_classifier.pt
+"""
 
 import os
-import importlib
+import numpy as np
+from dataclasses import asdict, dataclass
+
 import torch
-from torch.utils.data import DataLoader
-import pandas as pd
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from tqdm import tqdm
+from typing import Optional
 
-from modules.dataset_utils import extract_and_cache_embeddings, CachedEmbeddingDataset
-from modules.classifier_head import LinearHead
-from modules.train_utils import train_classifier
-from modules.eval_utils import evaluate_and_plot
-from modules.data_loader import ASVspoof2019Dataset
+# ===========================
+# USER CONFIG (edit here)
+# ===========================
+EXPERTS = ["style", "linguistic", "hubert", "wavelm", "emotion2vec"]  # which experts to train
 
-# ------------------- Config -------------------
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-CACHE_DIR = "cache/"
-BATCH_SIZE = 32
-LR = 1e-4
-EPOCHS = 50
-
-datasets_info = {
-    "train": {
-        "root_dir": "/nfs/turbo/umd-hafiz/issf_server_data/AsvSpoofData_2019/train/LA/ASVspoof2019_LA_train/flac",
-        "protocol_file": "/nfs/turbo/umd-hafiz/issf_server_data/AsvSpoofData_2019/train/LA/ASVspoof2019_train_protocol_with_speaker.txt",
-    },
-    "dev": {
-        "root_dir": "/nfs/turbo/umd-hafiz/issf_server_data/AsvSpoofData_2019/train/LA/ASVspoof2019_LA_dev/flac",
-        "protocol_file": "/nfs/turbo/umd-hafiz/issf_server_data/AsvSpoofData_2019/train/LA/ASVspoof2019_dev_protocol_with_speaker.txt",
-    },
-    "eval": {
-        "root_dir": "/nfs/turbo/umd-hafiz/issf_server_data/AsvSpoofData_2019/train/LA/ASVspoof2019_LA_eval/flac",
-        "protocol_file": "/nfs/turbo/umd-hafiz/issf_server_data/AsvSpoofData_2019/train/LA/ASVspoof2019_eval_protocol_with_speaker.txt",
-    }
+# per-expert head choice: "linear" | "resmlp" | "cosine"
+HEAD_TYPE_PER_EXPERT = {
+    "style": "resmlp",
+    "linguistic": "resmlp",
+    "hubert": "cosine",
+    "wavelm": "cosine",
+    "emotion2vec": "cosine",
 }
 
-EXPERT_NAMES = ["style", "linguistic", "hubert", "wavelm", "emotion2vec"]
-LOG_DIR = "logs/"
-os.makedirs(LOG_DIR, exist_ok=True)
+CACHE_DIR = "cache"
+CKPT_DIR  = "model_checkpoints"
+DATASET_NAME_FOR_TRAIN = "ASVspoof2019"  # we train heads on ASVspoof2019 train/dev caches
+
+BATCH_SIZE   = 256
+EPOCHS       = 50
+LR           = 1e-3
+WEIGHT_DECAY = 5e-3
+WARMUP_STEPS = 200
+PATIENCE     = 8
+NUM_WORKERS  = 4
+SEED         = 1337
+DEVICE       = "cuda" if torch.cuda.is_available() else "cpu"
+
+# Optional: override pos_weight per expert (None -> auto from train labels)
+POS_WEIGHT_OVERRIDES = {
+    # "style": 1.5,
+    # "linguistic": None,
+    # "hubert": None,
+    # "wavelm": None,
+}
+
+# ===========================
+# Imports from your module
+# ===========================
+try:
+    from modules.classifier_head import get_head
+except Exception:
+    from classifier_head import get_head
 
 
-# ------------------- Dynamic Expert Loader -------------------
-def get_expert_class(expert_name: str):
-    """
-    Dynamically fetch expert class from encoders/experts.py
-    Handles special capitalization like HuBERT.
-    """
-    mod = importlib.import_module("encoders.experts")
+# ===========================
+# Helpers
+# ===========================
+def set_seed(seed: int = 1337):
+    import random
+    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.benchmark = True
 
-    # Map expert_name to correct class names
-    class_map = {
-        "style": "StyleEncoder",
-        "linguistic": "LinguisticEncoder",
-        "hubert": "HuBERTEncoder",
-        "wavelm": "WaveLMEncoder",
-        "emotion2vec": "Emotion2VecEncoder"
+def compute_eer(y_true: np.ndarray, y_score: np.ndarray):
+    from sklearn.metrics import roc_curve
+    fpr, tpr, thr = roc_curve(y_true, y_score)
+    fnr = 1 - tpr
+    idx = int(np.nanargmin(np.abs(fnr - fpr)))
+    return float(fpr[idx]), float(thr[idx])
+
+def evaluate_metrics(y_true: np.ndarray, y_score: np.ndarray):
+    from sklearn.metrics import roc_curve, auc, f1_score, precision_score, recall_score, accuracy_score
+    eer, th = compute_eer(y_true, y_score)
+    fpr, tpr, _ = roc_curve(y_true, y_score)
+    auc_val = auc(fpr, tpr)
+    y_hat = (y_score >= th).astype(int)
+    return {
+        "eer": eer, "eer_threshold": th, "auc": auc_val,
+        "f1": f1_score(y_true, y_hat, zero_division=0),
+        "precision": precision_score(y_true, y_hat, zero_division=0),
+        "recall": recall_score(y_true, y_hat, zero_division=0),
+        "acc": accuracy_score(y_true, y_hat),
     }
 
-    if expert_name.lower() not in class_map:
-        raise ValueError(f"[ERROR] No expert class mapping for '{expert_name}'")
+def zscore_fit(X):
+    mu = X.mean(axis=0, keepdims=True)
+    sigma = X.std(axis=0, keepdims=True) + 1e-6
+    return mu.astype(np.float32), sigma.astype(np.float32)
 
-    cls_name = class_map[expert_name.lower()]
-    return getattr(mod, cls_name)
+def zscore_apply(X, mu, sigma):
+    return (X - mu) / sigma
 
-# ------------------- Pipeline -------------------
-def run_expert_pipeline(expert_name, dataloaders_raw):
-    print(f"\n=== Running pipeline for expert: {expert_name} ===")
-    try:
-        expert_cls = get_expert_class(expert_name)
-    except ValueError as e:
-        print(f"[WARN] Skipping {expert_name} due to error: {e}")
-        return None
+class NpDataset(Dataset):
+    def __init__(self, X: np.ndarray, y: np.ndarray):
+        self.X = torch.from_numpy(X).float()
+        self.y = torch.from_numpy(y.astype(np.float32)).float().view(-1, 1)
+    def __len__(self): return self.X.shape[0]
+    def __getitem__(self, idx): return self.X[idx], self.y[idx]
 
-    expert = expert_cls(freeze_model=True).to(DEVICE)
-
-    # Create cache, plot, and log directories per expert
-    enc_cache_dir = os.path.join(CACHE_DIR, expert_name)
-    os.makedirs(enc_cache_dir, exist_ok=True)
-    plot_dir = os.path.join("plots", expert_name)
-    log_file = os.path.join("logs", f"{expert_name}/eval_log.txt")
-    os.makedirs(plot_dir, exist_ok=True)
-    os.makedirs(os.path.dirname(log_file), exist_ok=True)
-
-    # Extract or load embeddings
-    cached_paths = {}
-    for split, loader in dataloaders_raw.items():
-        emb_path, lab_path = extract_and_cache_embeddings(expert, loader, enc_cache_dir, split, DEVICE)
-        cached_paths[split] = (emb_path, lab_path)
-
-    cached_datasets = {
-        split: CachedEmbeddingDataset(emb_path, lab_path)
-        for split, (emb_path, lab_path) in cached_paths.items()
-    }
-
-    loaders = {
-        split: DataLoader(ds, batch_size=BATCH_SIZE, shuffle=False)
-        for split, ds in cached_datasets.items()
-    }
-
-    # Train classifier
-    input_dim = cached_datasets["train"].embs.shape[1]
-    classifier = LinearHead(input_dim=input_dim).to(DEVICE)
-
-    print("[INFO] Training classifier...")
-    train_classifier(classifier, loaders["train"], loaders["dev"], DEVICE, lr=LR, epochs=EPOCHS,
-                     save_path=f"model_checkpoints/{expert_name}/best_classifier.pt")
-
-    # Evaluate and save plots/logs per expert
-    print("[INFO] Evaluating classifier...")
-    metrics = evaluate_and_plot(classifier, loaders["eval"], DEVICE,
-                                plot_dir=plot_dir,
-                                log_file=log_file)
-
-    # Handle None return from evaluate_and_plot
-    if metrics is None:
-        metrics = {}
-
-    metrics["expert"] = expert_name
-    return metrics
+@dataclass
+class TrainConfig:
+    expert: str
+    head_type: str
+    cache_dir: str = CACHE_DIR
+    ckpt_dir: str  = CKPT_DIR
+    batch_size: int = BATCH_SIZE
+    epochs: int     = EPOCHS
+    lr: float       = LR
+    weight_decay: float = WEIGHT_DECAY
+    warmup_steps: int   = WARMUP_STEPS
+    patience: int       = PATIENCE
+    num_workers: int    = NUM_WORKERS
+    seed: int           = SEED
+    device: str         = DEVICE
+    pos_weight: Optional[float] = None
 
 
-# ------------------- Main -------------------
+def prepare_data(cfg: TrainConfig, split: str):
+    root = os.path.join(cfg.cache_dir, DATASET_NAME_FOR_TRAIN, cfg.expert)
+    X = np.load(os.path.join(root, f"{split}_embeddings.npy"))
+    y = np.load(os.path.join(root, f"{split}_labels.npy")).astype(int).reshape(-1)
+    return X, y
+
+def get_scheduler(optimizer, total_steps, warmup_steps):
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return float(step + 1) / float(max(1, warmup_steps))
+        # cosine decay after warmup
+        progress = (step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+        return 0.5 * (1.0 + np.cos(np.pi * progress))
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+def train_one_epoch(model, loader, optimizer, scheduler, criterion, device):
+    model.train()
+    running = 0.0
+    for Xb, yb in loader:
+        Xb = Xb.to(device, non_blocking=True)
+        yb = yb.to(device, non_blocking=True)
+        optimizer.zero_grad(set_to_none=True)
+        logits = model(Xb)
+        loss = criterion(logits, yb)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+        optimizer.step()
+        scheduler.step()
+        running += float(loss.item()) * Xb.size(0)
+    return running / len(loader.dataset)
+
+@torch.no_grad()
+def infer_probs(model, loader, device):
+    model.eval()
+    probs, labels = [], []
+    for Xb, yb in loader:
+        Xb = Xb.to(device, non_blocking=True)
+        logits = model(Xb).squeeze(1)
+        p = torch.sigmoid(logits).cpu().numpy()
+        probs.append(p)
+        labels.append(yb.cpu().numpy().reshape(-1))
+    return np.concatenate(probs, axis=0), np.concatenate(labels, axis=0)
+
+def train_one_expert(expert: str, head_type: str):
+    print(f"\n===== Training expert: {expert} (head={head_type}) =====")
+    cfg = TrainConfig(
+        expert=expert,
+        head_type=head_type,
+        pos_weight=POS_WEIGHT_OVERRIDES.get(expert, None),
+    )
+
+    os.makedirs(os.path.join(cfg.ckpt_dir, cfg.expert), exist_ok=True)
+    set_seed(cfg.seed)
+    device = torch.device(cfg.device)
+
+    # --- Load data ---
+    Xtr, ytr = prepare_data(cfg, "train")
+    Xdv, ydv = prepare_data(cfg, "dev")
+
+    # z-score (fit on train)
+    mu, sigma = zscore_fit(Xtr)
+    Xtr = zscore_apply(Xtr, mu, sigma)
+    Xdv = zscore_apply(Xdv, mu, sigma)
+
+    in_dim = Xtr.shape[1]
+    model = get_head(cfg.head_type, input_dim=in_dim).to(device)
+
+    # pos_weight
+    if cfg.pos_weight is None:
+        pos = (ytr == 1).sum()
+        neg = (ytr == 0).sum()
+        pw = float(neg) / float(max(pos, 1))
+    else:
+        pw = float(cfg.pos_weight)
+
+    criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([pw], device=device))
+    opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+
+    train_ds = NpDataset(Xtr, ytr)
+    dev_ds   = NpDataset(Xdv, ydv)
+    train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True,
+                              num_workers=cfg.num_workers, pin_memory=True)
+    dev_loader   = DataLoader(dev_ds, batch_size=cfg.batch_size, shuffle=False,
+                              num_workers=cfg.num_workers, pin_memory=True)
+
+    total_steps = cfg.epochs * len(train_loader)
+    scheduler = get_scheduler(opt, total_steps=total_steps, warmup_steps=cfg.warmup_steps)
+
+    best_eer = 1e9
+    best_state = None
+    no_improve = 0
+
+    for epoch in range(1, cfg.epochs + 1):
+        loss_tr = train_one_epoch(model, train_loader, opt, scheduler, criterion, device)
+
+        # DEV
+        p_dev, y_dev = infer_probs(model, dev_loader, device)
+        mets = evaluate_metrics(y_dev, p_dev)
+        print(f"[{expert:>10s}][Epoch {epoch:02d}] "
+              f"loss={loss_tr:.4f} | EER={mets['eer']*100:.2f}% AUC={mets['auc']:.3f} "
+              f"F1={mets['f1']:.3f} Acc={mets['acc']:.3f}")
+
+        if mets["eer"] < best_eer:
+            best_eer = mets["eer"]; no_improve = 0
+            best_state = {
+                "state_dict": model.state_dict(),
+                "head_type": cfg.head_type,
+                "input_dim": in_dim,
+                "norm_mean": mu,
+                "norm_std": sigma,
+                "pos_weight": pw,
+                "metrics_dev": mets,
+                "config": asdict(cfg),
+            }
+            ckpt_path = os.path.join(cfg.ckpt_dir, cfg.expert, "best_classifier.pt")
+            torch.save(best_state, ckpt_path)
+            print(f"  🔸 Saved new best to {ckpt_path} -> {best_eer*100:.2f}% EER")
+        else:
+            no_improve += 1
+
+        if no_improve >= cfg.patience:
+            print(f"Early stopping (no improve {cfg.patience} epochs). Best EER={best_eer*100:.2f}%")
+            break
+
+    if best_state is None:
+        # still save last
+        best_state = {
+            "state_dict": model.state_dict(),
+            "head_type": head_type,
+            "input_dim": in_dim,
+            "norm_mean": mu,
+            "norm_std": sigma,
+            "pos_weight": pw,
+            "config": asdict(cfg),
+        }
+        torch.save(best_state, os.path.join(cfg.ckpt_dir, cfg.expert, "best_classifier.pt"))
+
+def main():
+    for exp in EXPERTS:
+        head = HEAD_TYPE_PER_EXPERT.get(exp, "resmlp")
+        train_one_expert(exp, head)
+
 if __name__ == "__main__":
-    # Load datasets
-    datasets = {}
-    for split, info in datasets_info.items():
-        ds = ASVspoof2019Dataset(root_dir=info["root_dir"], protocol_file=info["protocol_file"])
-        datasets[split] = ds
-        print(f"[INFO] Loaded {split}: {len(ds)} samples")
-
-    dataloaders_raw = {
-        split: DataLoader(ds, batch_size=BATCH_SIZE, shuffle=False)
-        for split, ds in datasets.items()
-    }
-
-    # Run all experts
-    summary = []
-    metrics_csv = os.path.join(LOG_DIR, "evaluation_metrics.csv")
-
-    # Create CSV with header if it doesn't exist
-    if not os.path.exists(metrics_csv):
-        pd.DataFrame(columns=["expert", "accuracy", "eer", "auc", "f1", "precision", "recall"]).to_csv(metrics_csv, index=False)
-
-    for expert_name in EXPERT_NAMES:
-        try:
-            metrics = run_expert_pipeline(expert_name, dataloaders_raw)
-            if metrics:
-                summary.append(metrics)
-
-                # ✅ Append metrics to the global CSV file
-                metrics_df = pd.DataFrame([metrics])
-                metrics_df.to_csv(metrics_csv, mode="a", index=False, header=False)
-
-        except Exception as e:
-            print(f"[WARN] Skipping {expert_name} due to error: {e}")
-
-    # Save summary table (redundant backup of all results)
-    summary_df = pd.DataFrame(summary)
-    summary_path = os.path.join(LOG_DIR, "expert_summary.csv")
-    summary_df.to_csv(summary_path, index=False)
-    print(f"\n✅ Summary table saved at: {summary_path}")
-    print(f"✅ Cumulative metrics saved at: {metrics_csv}")
+    main()

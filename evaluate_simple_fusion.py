@@ -1,182 +1,238 @@
-# scripts/eval_simple_fusions.py
+# ============================================================
+# evaluate_simple_fusion.py — ASVspoof2019 (eval) + ITW (eval)
+# Robust to PyTorch 2.6 weights_only change; no CLI, config at top.
+# ============================================================
 import os
+import glob
 import numpy as np
+import pandas as pd
 import torch
-from torch.utils.data import DataLoader
 from sklearn.metrics import (
-    roc_curve, auc, precision_recall_curve, confusion_matrix,
-    accuracy_score, f1_score, precision_score, recall_score
+    roc_curve, auc, f1_score, precision_score, recall_score, accuracy_score
 )
 
-from modules.classifier_head import LinearHead
-
-# ---------------- Config ----------------
+# ---------------- Config (edit here) ----------------
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-EXPERT_NAMES = ["style", "linguistic", "hubert", "wavelm"]  # adjust if needed
 
+EXPERT_NAMES = ["style", "linguistic", "hubert", "wavelm", "emotion2vec"]  # which experts to include
 CACHE_DIR = "cache"
 CKPT_DIR  = "model_checkpoints"
-OUT_DIR   = "logs/fusion"
+OUT_DIR   = "results"
 os.makedirs(OUT_DIR, exist_ok=True)
 
-SEED = 1337
+# Try these patterns to locate each expert's checkpoint
+CANDIDATE_PATTERNS = [
+    "{root}/{exp}/best_classifier.pt",
+    "{root}/{exp}/best_classifier.pth",
+    "{root}/{exp}/best.pt",
+    "{root}/{exp}_classifier/best_classifier.pt",
+    "{root}/{exp}_classifier/best.pt",
+    "{root}/experts/{exp}/best_classifier.pt",
+    "{root}/experts/{exp}/best.pt",
+]
 
-def set_seed(seed=SEED):
-    import random
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+# Optional: datasets to evaluate (must have caches under cache/<dataset>/<expert>/eval_*.npy)
+EVAL_DATASETS = ["ASVspoof2019", "ITW"]
 
-# --------- Utilities ----------
-def load_cached_embeddings(expert: str, split: str):
-    epath = os.path.join(CACHE_DIR, expert, f"{split}_embeddings.npy")
-    lpath = os.path.join(CACHE_DIR, expert, f"{split}_labels.npy")
-    if not (os.path.exists(epath) and os.path.exists(lpath)):
-        raise FileNotFoundError(f"Cache missing for {expert} {split}: {epath}, {lpath}")
-    embs = np.load(epath)
-    labs = np.load(lpath)
-    return embs, labs
+# ---------- Head factory import (robust) ----------
+HeadFactory = None
+try:
+    from modules.classifier_head import get_head as HeadFactory
+except Exception:
+    try:
+        from classifier_head import get_head as HeadFactory
+    except Exception:
+        HeadFactory = None
 
-def load_head(expert: str, input_dim: int):
-    head = LinearHead(input_dim=input_dim)
-    ckpt = os.path.join(CKPT_DIR, expert, "best_classifier.pt")
-    if not os.path.exists(ckpt):
-        raise FileNotFoundError(f"Missing classifier checkpoint for {expert}: {ckpt}")
-    state = torch.load(ckpt, map_location="cpu")
-    head.load_state_dict(state)
-    head.eval()
-    return head.to(DEVICE)
+def _default_linear(input_dim: int):
+    import torch.nn as nn
+    return nn.Linear(input_dim, 1)
 
-@torch.no_grad()
-def compute_logits_for_split(experts, split: str):
-    """
-    Returns:
-        logits_matrix: (N, E) float32 raw logits
-        labels:        (N,)  float32 labels (0/1)
+# --------------------- Utils ---------------------
+def fmt3(x):  return f"{x:.3f}"
+def fmt_pct(x): return f"{100*x:.2f}"
 
-    Assumes caches for this split were created with shuffle=False for all experts.
-    """
-    embs_list, labels_list, heads = [], [], []
-    for expert in experts:
-        embs, labs = load_cached_embeddings(expert, split)
-        embs_list.append(embs)
-        labels_list.append(labs)
-        heads.append(load_head(expert, embs.shape[1]))
-
-    # alignment check
-    for labs in labels_list[1:]:
-        if not np.array_equal(labels_list[0], labs):
-            raise ValueError(f"[ALIGNMENT ERROR] Label mismatch across experts for split='{split}'. "
-                             f"Re-extract with shuffle=False consistently.")
-    labels = labels_list[0].astype(np.float32)
-    N = embs_list[0].shape[0]
-    E = len(experts)
-
-    logits_all = np.zeros((N, E), dtype=np.float32)
-    bs = 2048
-    for i in range(0, N, bs):
-        j = min(i + bs, N)
-        for e_idx, (embs, head) in enumerate(zip(embs_list, heads)):
-            x = torch.tensor(embs[i:j], dtype=torch.float32, device=DEVICE)
-            out = head(x)                                # [b,1] logits
-            logits_all[i:j, e_idx] = out.squeeze(1).cpu().numpy()
-
-    return logits_all, labels
-
-# --------- Metrics ----------
-def evaluate_logits(y_true, y_logit):
-    """
-    y_logit: raw logits (before sigmoid)
-    Returns dict of metrics (accuracy, eer, auc, f1, precision, recall, eer_threshold)
-    """
-    y_true = np.asarray(y_true).astype(int)
-    y_score = 1.0 / (1.0 + np.exp(-np.asarray(y_logit)))  # sigmoid
-    y_bin = (y_score > 0.5).astype(int)
-
-    acc  = accuracy_score(y_true, y_bin)
-    prec = precision_score(y_true, y_bin, zero_division=0)
-    rec  = recall_score(y_true, y_bin, zero_division=0)
-    f1   = f1_score(y_true, y_bin, zero_division=0)
-
+def compute_eer(y_true: np.ndarray, y_score: np.ndarray):
     fpr, tpr, thr = roc_curve(y_true, y_score)
-    auc_val = auc(fpr, tpr)
     fnr = 1 - tpr
-    eer_idx = np.nanargmin(np.abs(fnr - fpr))
-    eer = fpr[eer_idx]
-    eer_thr = thr[eer_idx]
+    idx = int(np.nanargmin(np.abs(fnr - fpr)))
+    return float(fpr[idx]), float(thr[idx])
 
+def evaluate_scores(y_true: np.ndarray, y_score: np.ndarray):
+    eer, th = compute_eer(y_true, y_score)
+    fpr, tpr, _ = roc_curve(y_true, y_score)
+    auc_val = auc(fpr, tpr)
+    y_hat = (y_score >= th).astype(int)
     return {
-        "accuracy": float(acc),
-        "eer": float(eer),
-        "auc": float(auc_val),
-        "f1": float(f1),
-        "precision": float(prec),
-        "recall": float(rec),
-        "eer_threshold": float(eer_thr),
+        "eer": eer,
+        "eer_threshold": th,
+        "auc": auc_val,
+        "f1": f1_score(y_true, y_hat, zero_division=0),
+        "precision": precision_score(y_true, y_hat, zero_division=0),
+        "recall": recall_score(y_true, y_hat, zero_division=0),
+        "acc": accuracy_score(y_true, y_hat),
     }
 
-def simple_fusions(logits_matrix):
+def extract_state_dict(obj):
+    # If the object already looks like a state_dict (tensor values), return it.
+    if isinstance(obj, dict) and any(isinstance(v, torch.Tensor) for v in obj.values()):
+        return obj
+    # Common wrappers
+    if isinstance(obj, dict):
+        for k in ["state_dict", "model_state_dict", "model"]:
+            if k in obj and isinstance(obj[k], dict):
+                return obj[k]
+    raise TypeError("Unrecognized checkpoint format for state_dict extraction.")
+
+def clean_state_dict_keys(sd: dict):
+    # Properly strip 'module.' once; do not duplicate keys.
+    out = {}
+    for k, v in sd.items():
+        if k.startswith("module."):
+            out[k[len("module."):]] = v
+        else:
+            out[k] = v
+    return out
+
+def find_checkpoint_for_expert(expert: str) -> str:
+    for pat in CANDIDATE_PATTERNS:
+        path = pat.format(root=CKPT_DIR, exp=expert)
+        if os.path.exists(path):
+            return path
+    cands = []
+    for ext in ("*.pt", "*.pth"):
+        for p in glob.glob(os.path.join(CKPT_DIR, "**", ext), recursive=True):
+            base = os.path.basename(p).lower()
+            if expert.lower() in p.lower() and "best" in base:
+                cands.append(p)
+    return sorted(cands)[0] if cands else ""
+
+def load_cached(dataset_name: str, expert: str, split="eval"):
+    emb = os.path.join(CACHE_DIR, dataset_name, expert, f"{split}_embeddings.npy")
+    lab = os.path.join(CACHE_DIR, dataset_name, expert, f"{split}_labels.npy")
+    if not (os.path.exists(emb) and os.path.exists(lab)):
+        return None, None
+    X = np.load(emb)
+    y = np.load(lab).astype(int).reshape(-1)
+    return X, y
+
+def instantiate_head_from_ckpt(ckpt: dict, input_dim: int):
+    head_type = (ckpt.get("head_type") or "linear").lower()
+    if HeadFactory is not None:
+        try:
+            return HeadFactory(head_type, input_dim=input_dim)
+        except Exception:
+            pass
+    return _default_linear(input_dim)
+
+def _torch_load_compat(path: str):
     """
-    Return dict of baseline fused raw logits (no learning):
-      - mean:   mean over experts
-      - max:    elementwise max over experts
-      - median: elementwise median over experts
+    Force weights_only=False for PyTorch >=2.6, and stay compatible with older versions.
     """
-    return {
-        "mean_fusion":   logits_matrix.mean(axis=1),
-        "max_fusion":    logits_matrix.max(axis=1),
-        "median_fusion": np.median(logits_matrix, axis=1),
+    try:
+        return torch.load(path, map_location=DEVICE, weights_only=False)
+    except TypeError:
+        # Older PyTorch without weights_only arg
+        return torch.load(path, map_location=DEVICE)
+
+def run_classifier_probs(X: np.ndarray, ckpt_path: str) -> np.ndarray:
+    """
+    Load checkpoint (with weights_only=False), rebuild head, apply saved z-score, return probs (N,).
+    """
+    raw = _torch_load_compat(ckpt_path)
+    sd = clean_state_dict_keys(extract_state_dict(raw))
+
+    mu = raw.get("norm_mean", None)
+    sigma = raw.get("norm_std", None)
+    if mu is not None and sigma is not None:
+        Xn = (X - mu) / sigma
+    else:
+        Xn = X
+
+    input_dim = Xn.shape[1]
+    head = instantiate_head_from_ckpt(raw, input_dim).to(DEVICE)
+    head.load_state_dict(sd, strict=False)  # permissive loading across head variants
+    head.eval()
+
+    with torch.no_grad():
+        logits = head(torch.from_numpy(Xn).float().to(DEVICE)).squeeze(1)
+        probs = torch.sigmoid(logits).cpu().numpy()
+    return probs
+
+def evaluate_dataset(dataset_name: str, experts: list[str]) -> pd.DataFrame:
+    scores = {}
+    y_ref = None
+    available = []
+
+    for exp in experts:
+        X, y = load_cached(dataset_name, exp, split="eval")
+        if X is None:
+            print(f"[{dataset_name}] Missing embeddings for expert='{exp}', skipping.")
+            continue
+        if y_ref is None:
+            y_ref = y
+        elif len(y) != len(y_ref):
+            print(f"[WARN] {dataset_name}:{exp} length mismatch ({len(y)} vs {len(y_ref)}), skipping.")
+            continue
+
+        ckpt = find_checkpoint_for_expert(exp)
+        if not ckpt:
+            print(f"[{dataset_name}] No checkpoint found for expert '{exp}', skipping.")
+            continue
+
+        probs = run_classifier_probs(X, ckpt)
+        scores[exp] = probs
+        available.append(exp)
+
+    if not available:
+        return pd.DataFrame()
+
+    mat = np.stack([scores[e] for e in available], axis=1)  # (N, E)
+    fusion_defs = {
+        "mean_fusion":   mat.mean(axis=1),
+        "max_fusion":    mat.max(axis=1),
+        "median_fusion": np.median(mat, axis=1),
     }
 
-# ---------------- Main ----------------
+    rows = []
+    for method, s in fusion_defs.items():
+        m = evaluate_scores(y_ref, s)
+        rows.append({"dataset": dataset_name, "method": method, **m})
+
+    for e in available:
+        m = evaluate_scores(y_ref, scores[e])
+        rows.append({"dataset": dataset_name, "method": f"{e}_alone", **m})
+
+    return pd.DataFrame(rows)
+
+# --------------------- Main ---------------------
 if __name__ == "__main__":
-    set_seed()
+    parts = []
+    for dname in EVAL_DATASETS:
+        df_d = evaluate_dataset(dname, EXPERT_NAMES)
+        if not df_d.empty:
+            parts.append(df_d)
 
-    # 1) Per-expert logits for EVAL
-    print("[FUSION] Computing per-expert logits for EVAL...")
-    eval_logits, eval_labels = compute_logits_for_split(EXPERT_NAMES, "eval")
+    if not parts:
+        print("[ERROR] Nothing evaluated (missing caches or checkpoints).")
+        raise SystemExit(1)
 
-    # 2) Evaluate per-expert and simple fusions
-    results = []
-
-    # per-expert baselines
-    for i, name in enumerate(EXPERT_NAMES):
-        m = evaluate_logits(eval_labels, eval_logits[:, i])
-        m["method"] = name
-        results.append(m)
-
-    # simple, non-learned fusions
-    for tag, vec in simple_fusions(eval_logits).items():
-        m = evaluate_logits(eval_labels, vec)
-        m["method"] = tag
-        results.append(m)
-
-    # 3) Save/print formatted table
-    import pandas as pd
-    cols = ["method","accuracy","eer","auc","f1","precision","recall","eer_threshold"]
-    df = pd.DataFrame(results)[cols]
-
-    # formatting: accuracy & EER as percentages (2 decimals); others 3 decimals
-    fmt_pct = lambda x: f"{x*100:.2f}"
-    fmt3    = lambda x: f"{x:.3f}"
-
+    df = pd.concat(parts, ignore_index=True)
     df_fmt = pd.DataFrame({
-        "method":         df["method"],
-        "accuracy (%)":   df["accuracy"].apply(fmt_pct),
-        "eer (%)":        df["eer"].apply(fmt_pct),
-        "auc":            df["auc"].apply(fmt3),
-        "f1":             df["f1"].apply(fmt3),
-        "precision":      df["precision"].apply(fmt3),
-        "recall":         df["recall"].apply(fmt3),
-        "eer_threshold":  df["eer_threshold"].apply(fmt3),
+        "dataset":       df["dataset"],
+        "method":        df["method"],
+        "eer (%)":       df["eer"].apply(fmt_pct),
+        "auc":           df["auc"].apply(fmt3),
+        "f1":            df["f1"].apply(fmt3),
+        "precision":     df["precision"].apply(fmt3),
+        "recall":        df["recall"].apply(fmt3),
+        "acc":           df["acc"].apply(fmt3),
+        "eer_threshold": df["eer_threshold"].apply(fmt3),
     })
 
-    out_csv = os.path.join(OUT_DIR, "eval_simple_fusions.csv")
+    out_csv = os.path.join(OUT_DIR, "simple_fusions_ASV19_and_ITW.csv")
     df_fmt.to_csv(out_csv, index=False)
 
-    print("\n[Simple Fusions] EVAL Comparison")
+    print("\n[Simple Fusions] Combined results")
     print(df_fmt.to_string(index=False))
-    print(f"[Simple Fusions] Wrote CSV to {out_csv}")
+    print(f"\n[✓] Wrote CSV to {out_csv}")
